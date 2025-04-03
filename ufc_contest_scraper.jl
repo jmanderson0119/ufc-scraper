@@ -1,5 +1,6 @@
 using PyCall
 using Gumbo
+using ArgParse  # For command-line argument parsing
 
 # pre-allocate all python imports at the beginning
 const webdriver = PyNULL()
@@ -25,9 +26,20 @@ const MONTH_MAP = Dict("January" => "01", "February" => "02", "March" => "03", "
                       "May" => "05", "June" => "06", "July" => "07", "August" => "08", 
                       "September" => "09", "October" => "10", "November" => "11", "December" => "12")
 
+# Win methods to exclude
+const EXCLUDED_WIN_METHODS = [
+    "DQ", "Disqualification", "Overturned", 
+    "No Contest", "NC", "Could Not Continue",
+    "Decision - Majority", "Decision - Split", "Other"
+]
+
 # optimized helper functions with type annotations
 function convert_date(date_ls::Vector{SubString{String}})::Int
-    return parse(Int, join([date_ls[4], date_ls[3], MONTH_MAP[date_ls[2]]], ""))
+    return parse(Int, join([date_ls[4], MONTH_MAP[date_ls[2]], date_ls[3]], ""))
+end
+
+function get_year_from_date(date_int::Int)::Int
+    return div(date_int, 10000)
 end
 
 function convert_to_seconds(match_duration::Vector{SubString{String}})::Int
@@ -36,6 +48,19 @@ end
 
 function clean_result_data(contest_results_elem, elem)::String
     return strip(string(text(contest_results_elem[elem][2])), [' ', '\n'])
+end
+
+function should_exclude_win_method(win_method::String)::Bool
+    if isempty(win_method)
+        return false
+    end
+    normalized_method = strip(win_method)
+    for method in EXCLUDED_WIN_METHODS
+        if occursin(lowercase(method), lowercase(normalized_method))
+            return true
+        end
+    end
+    return false
 end
 
 function reformat_contest_data(contest_fighter_bout_info, contest_results, 
@@ -86,6 +111,14 @@ function save_to_csv(data, header, filename)
     end
 end
 
+# Save benchmark file
+function save_benchmark(data, header, basename, benchmark_num)
+    benchmark_file = "$(splitext(basename)[1])_benchmark_$(benchmark_num).csv"
+    println("Saving benchmark file $benchmark_file with $(length(data)) records")
+    save_to_csv(data, header, benchmark_file)
+    println("Benchmark $benchmark_num saved successfully")
+end
+
 # reusable function to create chrome driver with options
 function create_chrome_driver()
     chrome_options = options.Options()
@@ -106,7 +139,7 @@ function create_chrome_driver()
     return webdriver.Chrome(service=chrome_service, options=chrome_options)
 end
 
-function scrape_contest(contest_url)
+function scrape_contest(contest_url, start_year, end_year)
     driver = create_chrome_driver()
 
     try
@@ -132,12 +165,16 @@ function scrape_contest(contest_url)
         contest_fighter_info = parsed_html.root[2][2][1][2][1]
         
         # get event date
-        event_link = driver.find_element(by.CLASS_NAME, "b-link")
-        event_link.click()
-        wait_obj.until(expected_conditions.presence_of_element_located((by.CLASS_NAME, "b-list__box-list-item")))
-        event_date = convert_date(split(replace(driver.find_element(by.CLASS_NAME, "b-list__box-list-item").text, "," => ""), " "))
-        driver.back()
-        wait_obj.until(expected_conditions.presence_of_element_located((by.CLASS_NAME, "b-fight-details")))
+        event_date_elem = driver.find_element(by.CLASS_NAME, "b-list__box-list-item")
+        event_date_text = event_date_elem.text
+        event_date = convert_date(split(replace(event_date_text, "," => ""), " "))
+        
+        # Check if date is within range
+        year = get_year_from_date(event_date)
+        if year < start_year || year > end_year
+            println("Skipping fight from year $year (outside range $start_year-$end_year)")
+            return nothing
+        end
         
         # store values directly in pre-allocated array
         contest_fighter_bout_info[1] = event_date
@@ -149,6 +186,9 @@ function scrape_contest(contest_url)
         contest_fighter_bout_info[5] = string(text(contest_fighter_info[2][1]))
         contest_fighter_bout_info[6] = string(text(contest_fighter_info[2][2][1][1]))
 
+        # Log the fighter info for debugging
+        println("Fight: $(contest_fighter_bout_info[4]) ($(contest_fighter_bout_info[3])) vs $(contest_fighter_bout_info[6]) ($(contest_fighter_bout_info[5]))")
+
         # scrape contest results
         contest_outcomes = parsed_html.root[2][2][1][2]
         contest_results_elem = contest_outcomes[2][2][1]
@@ -156,10 +196,19 @@ function scrape_contest(contest_url)
         # direct array assignment
         contest_results[1] = string(text(contest_results_elem[1][2]))
         
+        # Check if win method should be excluded
+        if should_exclude_win_method(contest_results[1])
+            println("Skipping fight with excluded win method: $(contest_results[1])")
+            return nothing
+        end
+        
         round_end = parse(Int, string(text(contest_results_elem[2][2])))
         contest_results[2] = (round_end - 1) * 300 + convert_to_seconds(split(clean_result_data(contest_results_elem, 3), ':'))
         
         contest_results[3] = parse(Int, string(split(clean_result_data(contest_results_elem, 4), ' ')[1]))
+
+        # Log fight details
+        println("Method: $(contest_results[1]), Duration: $(contest_results[2]) seconds, Format: $(contest_results[3])")
 
         # scrape contest totals
         contest_totals_elem = contest_outcomes[4][1][2]
@@ -245,6 +294,9 @@ function scrape_contest(contest_url)
             contest_totals_fighter1, contest_totals_fighter2, 
             sig_str_totals_fighter1, sig_str_totals_fighter2)
 
+    catch e
+        println("Error scraping contest $contest_url: $e")
+        return nothing
     finally
         driver.quit()
     end
@@ -274,8 +326,10 @@ function extract_event_urls()
             end
         end
         
+        println("Found $(length(event_urls)) event URLs")
+        
     catch e
-        println("Error occurred: $e")
+        println("Error occurred while extracting event URLs: $e")
     finally
         driver.quit()
     end
@@ -283,7 +337,7 @@ function extract_event_urls()
     return event_urls
 end
 
-function extract_contest_urls(event_urls)
+function extract_contest_urls(event_urls, start_year, end_year)
     driver = create_chrome_driver()
     contest_urls = String[]
     
@@ -298,6 +352,21 @@ function extract_contest_urls(event_urls)
             try
                 driver.get(event_url)
                 wait_obj = wait.WebDriverWait(driver, 10)
+                
+                # Get event date to check if it's within our year range
+                wait_obj.until(expected_conditions.presence_of_element_located((by.CLASS_NAME, "b-list__box-list-item")))
+                event_date_elem = driver.find_element(by.CLASS_NAME, "b-list__box-list-item")
+                event_date_text = event_date_elem.text
+                event_date = convert_date(split(replace(event_date_text, "," => ""), " "))
+                year = get_year_from_date(event_date)
+                
+                if year < start_year || year > end_year
+                    println("Skipping event from year $year (outside range $start_year-$end_year)")
+                    continue
+                end
+                
+                println("Event from year $year - processing")
+                
                 wait_obj.until(expected_conditions.presence_of_element_located((by.CLASS_NAME, "b-fight-details__table")))
                 
                 # extract all fight urls at once
@@ -316,12 +385,12 @@ function extract_contest_urls(event_urls)
                 continue
             end
             
-            # reduced sleep time slightly
+            # throttle to avoid overloading the server
             sleep(0.2)
         end
         
     catch e
-        println("Error occurred: $e")
+        println("Error occurred while extracting contest URLs: $e")
     finally
         driver.quit()
     end
@@ -330,7 +399,7 @@ function extract_contest_urls(event_urls)
     return contest_urls
 end
 
-function scrape_ufc(contest_urls)
+function scrape_ufc(contest_urls, start_year, end_year, output_file, benchmark_interval)
     # pre-allocate with reasonable size (2 fighters per contest)
     match_summaries = Vector{Any}(undef, 0)
     sizehint!(match_summaries, length(contest_urls) * 2)
@@ -344,46 +413,187 @@ function scrape_ufc(contest_urls)
              "clinch_attempted", "ground_landed", "ground_attempted"]
     
     # process contest_urls
-    total_summaries = length(contest_urls)
-    println("Starting to process $total_summaries fight summaries...")
+    total_contests = length(contest_urls)
+    println("Starting to process $total_contests fight summaries...")
     
-    # enable parallelization for independent tasks
-    # note: we keep a single thread for web scraping to avoid overloading the server
+    processed_count = 0
+    benchmark_count = 0
+    
+    # process contests
     for (index, contest_url) in enumerate(contest_urls)
         try
-            println("Processing fight $index of $total_summaries: $contest_url")
+            println("Processing fight $(index) of $(total_contests): $(contest_url)")
             
-            fighter1_data, fighter2_data = scrape_contest(contest_url)
-            push!(match_summaries, fighter1_data)
-            push!(match_summaries, fighter2_data)
+            result = scrape_contest(contest_url, start_year, end_year)
             
-            # reduced sleep time slightly
+            if result !== nothing
+                fighter1_data, fighter2_data = result
+                push!(match_summaries, fighter1_data)
+                push!(match_summaries, fighter2_data)
+                processed_count += 1
+                
+                # Save benchmark file every N contests
+                if index > 0 && index % benchmark_interval == 0
+                    benchmark_count += 1
+                    save_benchmark(match_summaries, header, output_file, benchmark_count)
+                end
+            end
+            
+            # throttle to avoid overloading the server
             sleep(0.2)
             
         catch e
             println("Error processing fight $contest_url: $e")
             println(stacktrace())
+            
+            # Save emergency benchmark if we've processed enough fights
+            if index > 0 && index % 50 == 0 && length(match_summaries) > 0
+                try
+                    save_benchmark(match_summaries, header, output_file, "emergency_$(index)")
+                catch bench_err
+                    println("Failed to save emergency benchmark: $bench_err")
+                end
+            end
         end
     end
     
-    # save dataset
-    save_to_csv(match_summaries, header, "ufc_match_summaries.csv")
-    println("Dataset saved to ufc_match_summaries.csv")
+    # Save final complete benchmark
+    if length(match_summaries) > 0
+        save_benchmark(match_summaries, header, output_file, "complete")
+    end
+    
+    # save dataset to main output file
+    save_to_csv(match_summaries, header, output_file)
+    println("Dataset saved to $output_file")
+    println("Processed $processed_count fights out of $total_contests URLs")
+    println("Total fighter records: $(length(match_summaries))")
+    
     return match_summaries
 end
 
+function parse_commandline()
+    s = ArgParseSettings()
+    
+    @add_arg_table! s begin
+        "--start-year", "-s"
+            help = "Start year (default: 2001)"
+            arg_type = Int
+            default = 2001
+        "--end-year", "-e"
+            help = "End year (default: 2018)"
+            arg_type = Int
+            default = 2018
+        "--output-file", "-o"
+            help = "Output CSV file (default: ufc_match_summaries.csv)"
+            arg_type = String
+            default = "ufc_match_summaries.csv"
+        "--benchmark-interval", "-i"
+            help = "Save benchmark files every N contests (default: 100)"
+            arg_type = Int
+            default = 100
+        "--throttle", "-t"
+            help = "Milliseconds to wait between requests (default: 200)"
+            arg_type = Int
+            default = 200
+    end
+    
+    return parse_args(s)
+end
+
 function main()
+    # parse command line arguments
+    parsed_args = parse_commandline()
+    start_year = parsed_args["start-year"]
+    end_year = parsed_args["end-year"]
+    output_file = parsed_args["output-file"] 
+    benchmark_interval = parsed_args["benchmark-interval"]
+    throttle = parsed_args["throttle"] / 1000  # convert to seconds
+    
+    println("UFC Scraper - filtering fights from $start_year to $end_year")
+    println("Output file: $output_file")
+    println("Benchmark interval: every $benchmark_interval contests")
+    println("Throttle: $(throttle*1000) ms")
+    
+    # Create log file
+    log_file = "$(splitext(output_file)[1])_scraper.log"
+    log_io = open(log_file, "w")
+    
+    # Save original stdout and redirect to both console and log file
+    original_stdout = stdout
+    redirect_stdout(TeeStream(original_stdout, log_io))
+    
     # initialize the pycall modules
     __init__()
     
-    # extract events
-    event_urls = extract_event_urls()
+    try
+        start_time = time()
+        
+        # extract events
+        println("Extracting event URLs...")
+        event_urls = extract_event_urls()
+        println("Extracted $(length(event_urls)) event URLs")
+        
+        # Save event URLs to file for recovery if needed
+        event_urls_file = "$(splitext(output_file)[1])_event_urls.json"
+        open(event_urls_file, "w") do io
+            println(io, "[")
+            for (i, url) in enumerate(event_urls)
+                println(io, "  \"$url\"$(i < length(event_urls) ? "," : "")")
+            end
+            println(io, "]")
+        end
+        println("Saved event URLs to $event_urls_file")
+        
+        # extract contests
+        println("Extracting contest URLs...")
+        contest_urls = extract_contest_urls(event_urls, start_year, end_year)
+        println("Extracted $(length(contest_urls)) contest URLs")
+        
+        # Save contest URLs to file for recovery if needed
+        contest_urls_file = "$(splitext(output_file)[1])_contest_urls.json"
+        open(contest_urls_file, "w") do io
+            println(io, "[")
+            for (i, url) in enumerate(contest_urls)
+                println(io, "  \"$url\"$(i < length(contest_urls) ? "," : "")")
+            end
+            println(io, "]")
+        end
+        println("Saved contest URLs to $contest_urls_file")
+        
+        # scrape UFC data
+        println("Scraping UFC fight data...")
+        scrape_ufc(contest_urls, start_year, end_year, output_file, benchmark_interval)
+        
+        end_time = time()
+        println("Total execution time: $(round(end_time - start_time, digits=2)) seconds")
+        
+    catch e
+        println("Fatal error in main function: $e")
+        println(stacktrace())
+    finally
+        # Restore original stdout
+        redirect_stdout(original_stdout)
+        close(log_io)
+    end
+end
 
-    # extract contests
-    contest_urls = extract_contest_urls(event_urls)
+# TeeStream to redirect output to both console and log file
+struct TeeStream <: IO
+    out1::IO
+    out2::IO
+end
 
-    # save contest summaries
-    scrape_ufc(contest_urls)
+function Base.write(ts::TeeStream, x::UInt8)
+    write(ts.out1, x)
+    write(ts.out2, x)
+    return 1
+end
+
+function Base.write(ts::TeeStream, x::AbstractVector{UInt8})
+    n = length(x)
+    write(ts.out1, x)
+    write(ts.out2, x)
+    return n
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
